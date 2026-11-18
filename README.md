@@ -100,12 +100,11 @@ upload.
   `latest/` sync leaves the previous `latest/.release.json`, and the next run
   redoes it.
 - **`latest/` follows the requested version.** Publishing an older version
-  moves `latest/` back to it. That is also how you roll back: run the tool
-  with the previous version.
+  moves `latest/` back to it.
 - **`latest/` is not updated atomically.** S3 has no atomic directory
-  rename. While `latest/` is being synced, clients may briefly see a mix of
-  old and new files. If that matters, serve `versions/<v>/` and switch the
-  origin path at your proxy/CDN instead.
+  rename. While `latest/` is being synced, clients may see a mix of old and
+  new files. For production, serve `versions/<v>/` instead (see
+  [Which directory to serve](#which-directory-to-serve)).
 - Running two instances at the same time on the same prefix is not
   supported (there is no lock). Use a single scheduler entry or job.
 
@@ -163,12 +162,47 @@ The bucket only stores the files. BentoPDF needs a few things that plain S3
 static website hosting cannot provide, so put a reverse proxy or CDN
 (nginx, Caddy, Traefik, CloudFront, Cloudflare, ...) in front of it.
 
+### Which directory to serve
+
+**Recommended: `versions/<version>/`.** Once its completion marker is
+written, a version directory is immutable: no later run writes to it again.
+Point the proxy or CDN origin at it, e.g. `<bucket>/bentopdf/versions/2.8.11/`.
+
+To deploy a new version, or to roll back, publish it with this tool, then
+switch the origin path from one version directory to the other
+(`versions/2.8.11/` → `versions/2.8.12/`). That switch is a single
+configuration change (`caddy reload`, a CDN origin update): no live
+directory has its contents rewritten while being served, and each origin
+is always complete and consistent. On a proxy reload the switch is atomic.
+On a CDN, the new origin reaches each edge after a propagation delay.
+
+Keep previous version directories in the bucket. Clients may still run the
+previous version from cached HTML (browser, CDN, service worker) and request
+its hashed assets, which do not exist in the new directory. Because the old
+directory is still there, those requests can be answered: from the CDN cache,
+or by having the proxy fall back to the previous version directory on 404 for
+`/assets/` (in the Caddy example below, one more retry against the previous
+version directory before `error 404`). With
+`latest/`, those files are deleted. Keeping old versions also makes rollback a
+plain origin switch.
+
+**Convenience: `latest/`.** It always holds a copy of the last published
+version, which is handy for testing or low-stakes setups. It is updated
+in place by `rclone sync`, which is not atomic. During an update, or after
+an interrupted one until the next run repairs it, clients may get
+inconsistent files: new HTML with assets not uploaded yet, or cached HTML
+whose assets were just deleted.
+
+The publisher only writes to the bucket. It does not manage proxy or CDN
+configuration and does not switch traffic: changing the served version is
+a deployment step on your side.
+
 ### Serve it at a domain root
 
 The pre-built archives use absolute paths (`/assets/...`, `/wasm-settings`),
-because upstream builds them with the default `BASE_URL=/`. Serve
-`latest/` (or `versions/<v>/`) at the root of a host, for example
-`https://pdf.example.com/` mapped to `<bucket>/bentopdf/latest/`. Serving it
+because upstream builds them with the default `BASE_URL=/`. Serve the
+chosen directory at the root of a host, for example
+`https://pdf.example.com/` mapped to `<bucket>/bentopdf/versions/2.8.11/`. Serving it
 from a sub-path such as `https://example.com/bentopdf/` does **not** work
 with these archives. That would need a build from source with `BASE_URL` set.
 
@@ -177,7 +211,8 @@ with these archives. That would need a build from source with `BASE_URL` set.
 Internal links omit `.html` (`/merge-pdf` → `merge-pdf.html`, `/fr` →
 `fr/index.html`). The proxy must try `$uri`, then `$uri.html`, then
 `$uri/index.html`, like upstream's `nginx.conf`. Use `/404.html` as the
-error page.
+error page. S3 has no equivalent of `try_files`, so the proxy has to rewrite
+paths itself and retry on a missing object. The Caddy example below does this.
 
 ### Required response headers
 
@@ -191,7 +226,7 @@ headers, so the proxy must add them to every response:
 | `Cross-Origin-Opener-Policy` | `same-origin` |
 | `Cross-Origin-Embedder-Policy` | `credentialless` |
 | `Cross-Origin-Resource-Policy` | `cross-origin` |
-| `Content-Security-Policy` | copy it from `latest/_headers`; it lists the CDNs the WASM modules are loaded from |
+| `Content-Security-Policy` | copy it from `versions/<v>/_headers`; it lists the CDNs the WASM modules are loaded from |
 | `X-Content-Type-Options` | `nosniff` |
 | `X-Frame-Options` | `SAMEORIGIN` |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` |
@@ -219,35 +254,82 @@ and `pdfjs-annotation-viewer/` no caching. A stale `sw.js` (service worker)
 can keep old clients on a previous version, so always serve it with
 `Cache-Control: no-cache`.
 
-### Minimal nginx example
+### Caddy example
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name pdf.example.com;
+A complete [Caddy](https://caddyserver.com) configuration (tested with Caddy
+2.11), with S3 as the origin. It adds the required headers, maps clean URLs
+to objects, serves `/404.html` with a 404 status, and makes the served
+version a single variable.
 
-    add_header Cross-Origin-Opener-Policy   "same-origin" always;
-    add_header Cross-Origin-Embedder-Policy "credentialless" always;
-    add_header Cross-Origin-Resource-Policy "cross-origin" always;
-    add_header X-Content-Type-Options       "nosniff" always;
-    add_header X-Frame-Options              "SAMEORIGIN" always;
-    add_header Referrer-Policy              "strict-origin-when-cross-origin" always;
-    # add_header Content-Security-Policy "<copy from latest/_headers>" always;
+```caddyfile
+pdf.example.com {
+	# The version being served. Switch versions by changing this path and
+	# running "caddy reload", which is atomic.
+	vars origin /my-bucket/bentopdf/versions/2.8.11
 
-    location / {
-        # S3 has no "try_files": rewrite clean URLs to objects explicitly,
-        # or sync latest/ to local disk and use try_files $uri $uri.html $uri/index.html.
-        proxy_pass https://s3.example.com/my-bucket/bentopdf/latest/;
-        proxy_intercept_errors on;
-        error_page 403 404 = /404.html;
-    }
+	header {
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Embedder-Policy "credentialless"
+		Cross-Origin-Resource-Policy "cross-origin"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), camera=(), microphone=(), payment=(), usb=(), interest-cohort=()"
+		# Content-Security-Policy "<copy from versions/<v>/_headers>"
+	}
+	header /sw.js Cache-Control "no-cache"
+
+	# Clean URLs: "/" and "/fr/" -> index.html, "/merge-pdf" -> merge-pdf.html.
+	# "/fr" (a directory) is retried below as "/fr/index.html".
+	# Rewrites in one block are exclusive: the first matching one applies.
+	@dir path */
+	rewrite @dir {vars.origin}{path}index.html
+	@clean path_regexp ^(.*/)?[^/.]+$
+	rewrite @clean {vars.origin}{path}.html
+	rewrite * {vars.origin}{path}
+
+	reverse_proxy https://s3.example.com {
+		header_up Host {upstream_hostport}
+		# S3 answers 403 instead of 404 when listing is not allowed.
+		@missing status 403 404
+		handle_response @missing {
+			@was_clean vars_regexp {http.request.orig_uri.path} ^(.*/)?[^/.]+$
+			handle @was_clean {
+				rewrite * {vars.origin}{http.request.orig_uri.path}/index.html
+				reverse_proxy https://s3.example.com {
+					header_up Host {upstream_hostport}
+					@still_missing status 403 404
+					handle_response @still_missing {
+						error 404
+					}
+				}
+			}
+			handle {
+				error 404
+			}
+		}
+	}
+
+	handle_errors 404 {
+		rewrite * {vars.origin}/404.html
+		reverse_proxy https://s3.example.com {
+			header_up Host {upstream_hostport}
+			handle_response {
+				copy_response 404
+			}
+		}
+	}
 }
 ```
 
-Mapping clean URLs onto S3 objects depends on your proxy. For example, use
-an nginx `try_files` over a local mirror, a Caddy/Traefik rewrite, or a
-CloudFront Function or Cloudflare Worker that appends `.html` or
-`/index.html` to extensionless paths.
+Caddy sends plain, unsigned requests to S3. The objects under the prefix
+must be readable by the proxy: public read, or a bucket policy restricted
+to the proxy's address. With path-style URLs as above, `https://s3.example.com`
+is your S3 endpoint and `my-bucket` your bucket. For virtual-hosted style,
+use `https://my-bucket.s3.example.com` and drop `/my-bucket` from `origin`.
+On a CDN (CloudFront, Cloudflare, ...), the same logic goes into an edge
+function: append `.html`, or `/index.html`, to extensionless paths, and add
+the headers.
 
 ## Image
 
