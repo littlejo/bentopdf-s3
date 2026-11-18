@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,12 +22,15 @@ import (
 
 const testBase = "s3:bucket/bentopdf"
 
-// fakeRunner stands in for rclone. It keeps markers in memory as a tiny fake
-// bucket and lets tests inject failures by command prefix.
+// fakeRunner stands in for rclone. It keeps an in-memory fake bucket
+// (markers, and the other files of each remote directory), implements the
+// copy/sync/check semantics the publisher relies on, and lets tests inject
+// failures by command prefix.
 type fakeRunner struct {
 	calls   []Command
-	markers map[string]Marker // remote dir -> marker
-	failOn  string            // fail commands whose String() starts with this
+	markers map[string]Marker            // remote dir -> marker
+	files   map[string]map[string]string // remote dir -> relative path -> content, markers excluded
+	failOn  string                       // fail commands whose String() starts with this
 }
 
 func (f *fakeRunner) Run(_ context.Context, c Command) error {
@@ -50,8 +55,71 @@ func (f *fakeRunner) Run(_ context.Context, c Command) error {
 			return err
 		}
 		f.markers[strings.TrimSuffix(c.Args[2], "/"+markerName)] = m
+	case "copy", "sync":
+		// Markers live in f.markers and are never touched here, as with
+		// the "--exclude /.release.json" the publisher passes to sync.
+		src, err := f.tree(c.Args[1])
+		if err != nil {
+			return err
+		}
+		dst := c.Args[2]
+		if c.Args[0] == "sync" || f.files[dst] == nil {
+			f.files[dst] = map[string]string{}
+		}
+		for k, v := range src {
+			f.files[dst][k] = v
+		}
+	case "check":
+		args, oneWay := c.Args[1:], c.Args[1] == "--one-way"
+		if oneWay {
+			args = args[1:]
+		}
+		src, err := f.tree(args[0])
+		if err != nil {
+			return err
+		}
+		dst, _ := f.tree(args[1])
+		for k, v := range src {
+			if got, ok := dst[k]; !ok || got != v {
+				return &CommandError{Cmd: c.String(), ExitCode: 1, Err: fmt.Errorf("%s missing or different", k)}
+			}
+		}
+		for k := range dst {
+			if _, ok := src[k]; !ok && !oneWay {
+				return &CommandError{Cmd: c.String(), ExitCode: 1, Err: fmt.Errorf("%s only in destination", k)}
+			}
+		}
 	}
 	return nil
+}
+
+// tree returns the files of a local directory or of a fake remote one.
+func (f *fakeRunner) tree(path string) (map[string]string, error) {
+	if !strings.HasPrefix(path, "/") {
+		return maps.Clone(f.files[path]), nil
+	}
+	out := map[string]string{}
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, err := os.ReadFile(p)
+		rel, _ := filepath.Rel(path, p)
+		out[filepath.ToSlash(rel)] = string(data)
+		return err
+	})
+	return out, err
+}
+
+// siteFiles returns the files a ZIP made from entries should publish.
+func siteFiles(entries []zipEntry) map[string]string {
+	out := map[string]string{}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.name, "/") {
+			out[e.name] = e.body
+		}
+	}
+	return out
 }
 
 // commands returns the executed commands without rclone's logging flags and
@@ -90,7 +158,7 @@ func newTestEnv(t *testing.T, version string, markers map[string]Marker) *testEn
 	if markers == nil {
 		markers = map[string]Marker{}
 	}
-	te.runner = &fakeRunner{markers: markers}
+	te.runner = &fakeRunner{markers: markers, files: map[string]map[string]string{}}
 
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -141,8 +209,8 @@ var (
 		"rclone cat " + testBase + "/latest/.release.json",
 	}
 	uploadCmds = []string{
-		"rclone copy LOCAL " + testBase + "/versions/2.8.11",
-		"rclone check --one-way LOCAL " + testBase + "/versions/2.8.11",
+		"rclone sync LOCAL " + testBase + "/versions/2.8.11 --exclude /.release.json",
+		"rclone check LOCAL " + testBase + "/versions/2.8.11 --exclude /.release.json",
 		"rclone copyto LOCAL " + testBase + "/versions/2.8.11/.release.json",
 	}
 	latestCmds = []string{
@@ -176,21 +244,32 @@ func TestRunPublishesVersion(t *testing.T) {
 	te.assertWorkDirClean(t)
 }
 
-func TestRunNeverSyncsOrDeletesVersions(t *testing.T) {
+func TestRunSyncAndCheckNeverTouchMarkers(t *testing.T) {
 	te := newTestEnv(t, "2.8.11", nil)
 	if err := te.p.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range te.runner.calls {
 		switch c.Args[0] {
-		case "sync":
-			if !strings.HasSuffix(c.Args[2], "/latest") {
-				t.Errorf("sync targets %s, only latest/ may be synced", c.Args[2])
+		case "sync", "check":
+			// sync must never delete a marker, and a two-way check must
+			// not report the destination's marker as an extra file.
+			if !slices.Contains(c.Args, "--exclude") || !slices.Contains(c.Args, "/"+markerName) {
+				t.Errorf("%s: marker not excluded", c)
 			}
-		case "copy", "check", "copyto", "cat":
+			if slices.Contains(c.Args, "--one-way") {
+				t.Errorf("%s: one-way check misses extra destination files", c)
+			}
+		case "copyto", "cat":
 		default:
 			t.Errorf("unexpected rclone subcommand %q", c.Args[0])
 		}
+	}
+	if got, want := te.runner.files[testBase+"/versions/2.8.11"], siteFiles(siteEntries); !maps.Equal(got, want) {
+		t.Errorf("versions/2.8.11 = %v, want %v", got, want)
+	}
+	if got, want := te.runner.files[testBase+"/latest"], siteFiles(siteEntries); !maps.Equal(got, want) {
+		t.Errorf("latest = %v, want %v", got, want)
 	}
 }
 
@@ -267,17 +346,17 @@ func TestRunFailures(t *testing.T) {
 		},
 		{
 			name:         "upload fails",
-			setup:        func(te *testEnv) { te.runner.failOn = "rclone copy " },
+			setup:        func(te *testEnv) { te.runner.failOn = "rclone sync /" },
 			wantCommands: concat(readMarkers, uploadCmds[:1]),
 		},
 		{
 			name:         "upload verification fails",
-			setup:        func(te *testEnv) { te.runner.failOn = "rclone check --one-way" },
+			setup:        func(te *testEnv) { te.runner.failOn = "rclone check /" },
 			wantCommands: concat(readMarkers, uploadCmds[:2]),
 		},
 		{
 			name:         "latest sync fails",
-			setup:        func(te *testEnv) { te.runner.failOn = "rclone sync" },
+			setup:        func(te *testEnv) { te.runner.failOn = "rclone sync s3:" },
 			wantCommands: concat(readMarkers, uploadCmds, latestCmds[:1]),
 			wantVersion:  true,
 		},
@@ -308,7 +387,7 @@ func TestRunFailures(t *testing.T) {
 
 func TestRunRetriesAfterFailedUpload(t *testing.T) {
 	te := newTestEnv(t, "2.8.11", nil)
-	te.runner.failOn = "rclone check --one-way"
+	te.runner.failOn = "rclone check /"
 	if err := te.p.Run(context.Background()); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -318,6 +397,115 @@ func TestRunRetriesAfterFailedUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 	te.assertCommands(t, concat(readMarkers, uploadCmds, latestCmds))
+}
+
+func TestRunRecoversIncompleteVersionWithObsoleteFiles(t *testing.T) {
+	// An interrupted run left a partial version without marker: one file of
+	// the current archive and one that is not in it.
+	te := newTestEnv(t, "2.8.11", nil)
+	te.runner.files[testBase+"/versions/2.8.11"] = map[string]string{
+		"index.html":      "<html>",
+		"assets/old-1.js": "obsolete",
+	}
+	if err := te.p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := siteFiles(siteEntries)
+	if got := te.runner.files[testBase+"/versions/2.8.11"]; !maps.Equal(got, want) {
+		t.Errorf("versions/2.8.11 = %v, want exactly %v", got, want)
+	}
+	if got := te.runner.files[testBase+"/latest"]; !maps.Equal(got, want) {
+		t.Errorf("latest = %v, want exactly %v", got, want)
+	}
+	if _, ok := te.runner.markers[testBase+"/versions/2.8.11"]; !ok {
+		t.Error("version marker not written after a successful retry")
+	}
+}
+
+func TestRunRetryWithChangedArchive(t *testing.T) {
+	// First attempt: uploads archive A, then verification fails.
+	te := newTestEnv(t, "2.8.11", nil)
+	te.runner.failOn = "rclone check /"
+	if err := te.p.Run(context.Background()); err == nil {
+		t.Fatal("expected an error")
+	}
+	if _, ok := te.runner.markers[testBase+"/versions/2.8.11"]; ok {
+		t.Fatal("version marker written although verification failed")
+	}
+	if len(te.runner.files[testBase+"/versions/2.8.11"]) == 0 {
+		t.Fatal("test setup: first attempt should leave files behind")
+	}
+
+	// Upstream replaces the asset, and the retry downloads archive B.
+	changed := []zipEntry{
+		{name: "index.html", body: "<html v2>"},
+		{name: "assets/main-def.js", body: "js v2"},
+	}
+	te.zip = makeZip(t, changed)
+	te.runner.failOn = ""
+	if err := te.p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	want := siteFiles(changed)
+	for _, dir := range []string{testBase + "/versions/2.8.11", testBase + "/latest"} {
+		if got := te.runner.files[dir]; !maps.Equal(got, want) {
+			t.Errorf("%s = %v, want exactly %v", dir, got, want)
+		}
+	}
+	if m := te.runner.markers[testBase+"/versions/2.8.11"]; m.FileCount != len(want) {
+		t.Errorf("marker file_count = %d, want %d", m.FileCount, len(want))
+	}
+}
+
+func TestRunUploadFailureLeavesVersionUnpublished(t *testing.T) {
+	for _, failOn := range []string{"rclone sync /", "rclone check /"} {
+		t.Run(failOn, func(t *testing.T) {
+			te := newTestEnv(t, "2.8.11", nil)
+			te.runner.files[testBase+"/versions/2.8.11"] = map[string]string{"stale.js": "x"}
+			te.runner.failOn = failOn
+			if err := te.p.Run(context.Background()); err == nil {
+				t.Fatal("expected an error")
+			}
+			if _, ok := te.runner.markers[testBase+"/versions/2.8.11"]; ok {
+				t.Error("version marker written after a failed upload")
+			}
+			if _, ok := te.runner.files[testBase+"/latest"]; ok {
+				t.Error("latest/ written after a failed upload")
+			}
+		})
+	}
+}
+
+func TestRunDoesNotModifyCompletedVersion(t *testing.T) {
+	// A completed version whose content differs from the current archive
+	// (e.g. the asset changed upstream since) must be left as is, extra
+	// files included; only latest/ follows it.
+	published := map[string]string{"index.html": "<html v1>", "assets/old-1.js": "v1"}
+	te := newTestEnv(t, "2.8.11", map[string]Marker{
+		testBase + "/versions/2.8.11": {Version: "2.8.11", FileCount: 2},
+		testBase + "/latest":          {Version: "2.8.10"},
+	})
+	te.runner.files[testBase+"/versions/2.8.11"] = maps.Clone(published)
+	te.runner.files[testBase+"/latest"] = map[string]string{"index.html": "<html 2.8.10>"}
+
+	if err := te.p.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := te.runner.files[testBase+"/versions/2.8.11"]; !maps.Equal(got, published) {
+		t.Errorf("completed version modified: %v, want %v", got, published)
+	}
+	if got := te.runner.files[testBase+"/latest"]; !maps.Equal(got, published) {
+		t.Errorf("latest = %v, want %v", got, published)
+	}
+	for _, c := range te.runner.calls {
+		if len(c.Args) > 2 && c.Args[2] == testBase+"/versions/2.8.11" {
+			t.Errorf("command writes to a completed version: %s", c)
+		}
+	}
+	if te.downloads != 0 {
+		t.Errorf("downloads = %d, want 0", te.downloads)
+	}
 }
 
 func TestRunRemovesStaleWorkDirs(t *testing.T) {

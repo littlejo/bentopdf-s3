@@ -24,7 +24,8 @@ docker run --rm \
 3. Downloads it and verifies its size and its SHA-256 against the `digest`
    GitHub publishes for the asset.
 4. Extracts it safely and checks that `index.html` is at the archive root.
-5. `rclone copy` to `versions/<version>/`, then `rclone check` to verify it.
+5. `rclone sync` to `versions/<version>/`, then a two-way `rclone check`, so
+   the directory holds exactly the archive's files.
 6. Writes `versions/<version>/.release.json`, the completion marker.
 7. `rclone sync` from `versions/<version>/` to `latest/`, then `rclone check`.
 8. Writes `latest/.release.json`.
@@ -82,13 +83,22 @@ upload.
 | present | other version / missing | sync `latest/` from `versions/<v>/` |
 | missing | any | download, upload `versions/<v>/`, then sync `latest/` |
 
-- **Published versions are immutable.** `versions/<v>/` is only written with
-  `rclone copy`, which never deletes, and never again once its marker exists.
-  `rclone sync` is used only for `latest/`.
-- **Failures are retried safely.** An upload that fails before the marker
-  is written is simply redone by the next run. `latest/.release.json` is
-  excluded from the sync and written last, so an interrupted sync is
-  detected and redone.
+- **Published versions are immutable.** `versions/<v>/` is only written
+  while it has no marker. Once the marker exists, the directory is never
+  written again, even if the upstream asset has changed since.
+- **Failures are retried safely.** A version without a marker is
+  incomplete. The next run makes it an exact copy of the archive it has just
+  downloaded: `rclone sync` removes files left by an interrupted attempt,
+  even one made from an archive that has since changed upstream. The
+  two-way `rclone check` then fails on any missing, different or extra file.
+  The marker is written only after that check passes.
+- **Markers are handled explicitly.** Every `sync` and `check` runs with
+  `--exclude /.release.json`. The exclusion is anchored to the directory
+  root, so a nested file with the same name is still published. A sync can
+  never delete or copy a marker, and the check does not report one as an
+  extra file. Markers are written separately, last: an interrupted
+  `latest/` sync leaves the previous `latest/.release.json`, and the next run
+  redoes it.
 - **`latest/` follows the requested version.** Publishing an older version
   moves `latest/` back to it. That is also how you roll back: run the tool
   with the previous version.
@@ -141,7 +151,7 @@ JSON lines on stdout. rclone's output is logged line by line
 | GitHub API | 30 s |
 | Asset download | 10 min |
 | `rclone cat` / `copyto` | 2 min |
-| `rclone copy` / `sync` / `check` | 30 min each |
+| `rclone sync` / `check` | 30 min each |
 
 SIGTERM or SIGINT stops the running rclone process group: SIGTERM first,
 then SIGKILL after 15 s. The temporary directory is removed, and leftovers

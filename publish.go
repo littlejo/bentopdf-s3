@@ -32,9 +32,9 @@ type Marker struct {
 	UploadedAt  time.Time `json:"uploaded_at"`
 }
 
-// Store publishes to "<remote>:<bucket>/<prefix>" with rclone. Versioned
-// directories are only ever written with "rclone copy", which never deletes;
-// "rclone sync" is used exclusively for latest/.
+// Store publishes to "<remote>:<bucket>/<prefix>" with rclone. A version
+// directory is only written while it has no completion marker; once the
+// marker exists, it is never written again.
 type Store struct {
 	Runner Runner
 	Base   string
@@ -92,13 +92,19 @@ func (s *Store) WriteMarker(ctx context.Context, dir string, m Marker, tmpDir st
 	return nil
 }
 
-// UploadVersion copies the extracted site to versions/<v>/ and verifies it.
+// UploadVersion makes versions/<v>/ an exact copy of the extracted site and
+// verifies it. The caller must only use it for a version without completion
+// marker: "rclone sync" then also deletes files left by an interrupted
+// earlier attempt, possibly made from a different archive, and the
+// two-way "rclone check" fails on missing, different or extra files. The
+// marker is excluded so that sync can never delete it.
 func (s *Store) UploadVersion(ctx context.Context, localDir, version string) error {
 	dst := s.VersionPath(version)
-	if err := s.rclone(ctx, rcloneTransferTimeout, nil, nil, "copy", localDir, dst); err != nil {
+	exclude := "/" + markerName
+	if err := s.rclone(ctx, rcloneTransferTimeout, nil, nil, "sync", localDir, dst, "--exclude", exclude); err != nil {
 		return fmt.Errorf("upload %s: %w", dst, err)
 	}
-	if err := s.rclone(ctx, rcloneTransferTimeout, nil, nil, "check", "--one-way", localDir, dst); err != nil {
+	if err := s.rclone(ctx, rcloneTransferTimeout, nil, nil, "check", localDir, dst, "--exclude", exclude); err != nil {
 		return fmt.Errorf("verify %s: %w", dst, err)
 	}
 	return nil
